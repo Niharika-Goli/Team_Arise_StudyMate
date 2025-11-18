@@ -1,0 +1,271 @@
+# ===============================================
+# 1️⃣ Install Dependencies
+# ===============================================
+!pip install gradio pdfplumber sentence-transformers faiss-cpu transformers accelerate --quiet
+
+
+
+# ===============================================
+# 2️⃣ Imports
+# ===============================================
+import os
+import pdfplumber
+import gradio as gr
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+
+
+
+# ===============================================
+# 3️⃣ Add HuggingFace Token (IMPORTANT)
+# ===============================================
+os.environ["HF_TOKEN"] = "PASTE_YOUR_HUGGINGFACE_TOKEN_HERE"
+
+if os.environ["HF_TOKEN"] == "PASTE_YOUR_HUGGINGFACE_TOKEN_HERE":
+    print("⚠️ WARNING: Add your HuggingFace token inside the code!")
+else:
+    print("✅ HuggingFace Token Loaded")
+
+
+
+# ===============================================
+# 4️⃣ Load Embedding Model + LLM
+# ===============================================
+embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+llm = pipeline(
+    "text2text-generation",
+    model="google/flan-t5-large",
+    token=os.environ["HF_TOKEN"]
+)
+
+
+
+# =====================================================================
+# 5️⃣ PDF EXTRACTION
+# =====================================================================
+def extract_text_from_pdfs(pdf_files):
+    text = ""
+    for pdf in pdf_files:
+        try:
+            with pdfplumber.open(pdf.name) as p:
+                for page in p.pages:
+                    text += page.extract_text() or ""
+        except:
+            return None
+    return text if text.strip() != "" else None
+
+
+
+# =====================================================================
+# 6️⃣ CHUNKING
+# =====================================================================
+def chunk_text(text, chunk_size=350):
+    sentences = text.split(". ")
+    chunks, current = [], ""
+
+    for s in sentences:
+        if len(current) + len(s) <= chunk_size:
+            current += s + ". "
+        else:
+            chunks.append(current.strip())
+            current = s + ". "
+
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+
+
+# =====================================================================
+# 7️⃣ GLOBALS
+# =====================================================================
+chunks_global = []
+embeddings_global = None
+index_global = None
+full_text_global = ""
+chat_history = []
+
+
+
+# =====================================================================
+# 8️⃣ PROCESS PDF
+# =====================================================================
+def process_pdfs(pdf_files):
+    global chunks_global, embeddings_global, index_global, full_text_global
+
+    if not pdf_files:
+        return "❌ No PDF uploaded!"
+
+    text = extract_text_from_pdfs(pdf_files)
+    if text is None:
+        return "❌ Error reading PDF. It may be scanned."
+
+    full_text_global = text
+
+    chunks = chunk_text(text)
+    embeddings = embedder.encode(chunks)
+
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(np.array(embeddings))
+
+    chunks_global = chunks
+    embeddings_global = embeddings
+    index_global = index
+
+    return f"✅ PDF Processed Successfully! ({len(chunks)} chunks)"
+
+
+# =====================================================================
+# 9️⃣ SUMMARY GENERATOR
+# =====================================================================
+def generate_summary():
+    if full_text_global == "":
+        return "⚠ Please upload and process a PDF first."
+
+    summary_prompt = f"Summarize this text briefly:\n\n{full_text_global[:3000]}"
+    result = llm(summary_prompt, max_length=300)[0]["generated_text"]
+
+    return result
+
+
+
+# =====================================================================
+# 🔟 QUESTION ANSWERING
+# =====================================================================
+def answer_question(question):
+    global chat_history
+
+    if index_global is None:
+        return "⚠ Please process a PDF first."
+
+    q_embed = embedder.encode([question])
+    distances, retrieved_idx = index_global.search(q_embed, k=3)
+
+    context = "\n".join([chunks_global[i] for i in retrieved_idx[0]])
+
+    prompt = f"""
+    Context:
+    {context}
+
+    Question: {question}
+    Answer:
+    """
+
+    answer = llm(prompt, max_length=200)[0]["generated_text"]
+
+    chat_history.append((question, answer))
+    return answer, chat_history
+
+
+
+# =====================================================================
+# 1️⃣1️⃣ CUSTOM CSS (BEAUTIFUL UI)
+# =====================================================================
+custom_css = """
+body {
+    background: url('https://images.unsplash.com/photo-1515260464938-1c1bfb9c7bbb?auto=format&fit=crop&w=1400&q=60')
+        no-repeat center center fixed;
+    background-size: cover;
+}
+
+.header {
+    text-align:center;
+    padding:20px;
+    color:#fff;
+    font-size:32px;
+    font-weight:bold;
+    background:rgba(0,0,0,0.5);
+    border-radius:12px;
+    margin-bottom:20px;
+}
+
+.card {
+    background:rgba(255,255,255,0.85);
+    padding:25px;
+    border-radius:15px;
+    box-shadow:0 4px 20px rgba(0,0,0,0.3);
+}
+
+button {
+    font-size:18px !important;
+    font-weight:bold !important;
+    border-radius:10px !important;
+}
+"""
+
+
+
+# =====================================================================
+# 1️⃣2️⃣ MULTI-PAGE UI
+# =====================================================================
+with gr.Blocks(css=custom_css, title="StudyMate 2.0") as study_app:
+
+    # ---------------------------
+    # PAGE 1 – Home / Upload
+    # ---------------------------
+    with gr.Tab("📘 Upload PDFs"):
+        gr.HTML("<div class='header'>📘 StudyMate – Smart PDF Learning Assistant</div>")
+
+        with gr.Column(elem_classes="card"):
+
+            pdf_in = gr.File(label="Upload PDF(s)", file_count="multiple")
+            btn_process = gr.Button("Process PDFs")
+
+            status = gr.Textbox(label="Status", interactive=False)
+
+            next_btn = gr.Button("➡ Go to Q&A Page")
+
+        btn_process.click(process_pdfs, pdf_in, status)
+
+
+
+    # ---------------------------
+    # PAGE 2 – Q&A & Tools
+    # ---------------------------
+    with gr.Tab("🤖 Ask Questions"):
+        gr.HTML("<div class='header'>🤖 AI Q&A on Your PDF</div>")
+
+        with gr.Row():
+            with gr.Column(elem_classes="card"):
+                question = gr.Textbox(label="Ask a Question")
+                btn_ask = gr.Button("Get Answer")
+
+                answer = gr.Textbox(label="Answer")
+
+                chatbox = gr.Chatbot(label="Chat History")
+
+        btn_ask.click(answer_question, question, [answer, chatbox])
+
+
+
+    # ---------------------------
+    # PAGE 3 – Summary Page
+    # ---------------------------
+    with gr.Tab("📝 Summary"):
+        gr.HTML("<div class='header'>📝 Auto Summary</div>")
+        with gr.Column(elem_classes="card"):
+            btn_sum = gr.Button("Generate Summary")
+            summary_out = gr.Textbox(label="Summary", lines=8)
+
+        btn_sum.click(generate_summary, None, summary_out)
+
+
+
+    # ---------------------------
+    # PAGE 4 – Extracted Text
+    # ---------------------------
+    with gr.Tab("📄 Extracted Text"):
+        gr.HTML("<div class='header'>📄 PDF Extracted Text</div>")
+        text_out = gr.Textbox(label="Full Extracted Text", lines=20)
+
+        def show_text():
+            return full_text_global if full_text_global else "⚠ No PDF processed yet."
+
+        gr.Button("Show Extracted Text").click(show_text, None, text_out)
+
+
+
+study_app.launch(share=True, debug=True)
